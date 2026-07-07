@@ -17,6 +17,11 @@ The bot retrieves relevant context from uploaded documents, generates accurate a
 - **Gemini 2.5 Flash**: Fast and capable LLM for answer generation
 
 ---
+## Why Ollama?
+
+- **Free forever** — No usage-based billing
+- **No rate limits or token caps**
+- **Privacy-first** — Embeddings generated locally
 
 ##  Architecture
 
