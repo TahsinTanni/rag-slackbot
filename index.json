@@ -1,0 +1,215 @@
+{
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "a6149859-d2e7-4b16-9ef7-46f9e486e4d3",
+      "name": "When clicking Test workflow",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [64, -80]
+    },
+    {
+      "parameters": {
+        "resource": "fileFolder",
+        "returnAll": true,
+        "filter": {
+          "folderId": {
+            "__rl": true,
+            "value": "1lpzFsAYiRzVc2thE57nNLj-91t8UcPxu",
+            "mode": "id"
+          }
+        },
+        "options": {}
+      },
+      "id": "ca005ba5-6ff4-4ea5-acda-3af378733dea",
+      "name": "Google Drive - List Files1",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [288, -80],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "4EdyPrbHav8BDyKt",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "delete from documents where source_file = $1;",
+        "options": {
+          "queryBatching": "independently",
+          "queryReplacement": "={{ [$json.name] }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [512, -80],
+      "id": "31fecc35-a37a-4e1c-8b5e-80a4ad10060e",
+      "name": "Delete old chunks",
+      "executeOnce": false,
+      "credentials": {
+        "postgres": {
+          "id": "A9yJq4r8Yb4kYctm",
+          "name": "Postgres account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $('Google Drive - List Files1').all()[$itemIndex].json.id }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "id": "126ea62c-bc07-4740-bdbf-118ed4d7b473",
+      "name": "Google Drive - Download File1",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [736, -80],
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "4EdyPrbHav8BDyKt",
+          "name": "Google Drive account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "data",
+        "options": {}
+      },
+      "id": "f3a8c2d1-9e4b-4c6a-8f21-3d7b5a9c1e02",
+      "name": "Extract PDF Text",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [960, -80]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The upstream 'Extract PDF Text' node outputs the real extracted text\n// in item.json.text. We look up the original filename by item index from\n// the List Files node (rather than relying on binary metadata surviving\n// the extraction step) so department-tagging still works reliably.\nconst output = [];\nconst items = $input.all();\n\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  const fileName = $('Google Drive - List Files1').all()[i].json.name || 'unknown.txt';\n  const content = item.json.text || '';\n\n  let department = 'general';\n  if (fileName.startsWith('billing_')) department = 'billing';\n  else if (fileName.startsWith('engineering_')) department = 'engineering';\n  else if (fileName.startsWith('support_')) department = 'support';\n\n  output.push({ json: { source_file: fileName, department, content } });\n}\n\nreturn output;"
+      },
+      "id": "87ea7b6c-a217-4ea2-bc7d-76b4337c91ee",
+      "name": "Parse File to Text1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1184, -80]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Chunk each document into ~200-word pieces with 40% overlap\nconst CHUNK_SIZE = 200;\nconst OVERLAP = 80;\n\nconst output = [];\n\nfor (const item of $input.all()) {\n  const { source_file, department, content } = item.json;\n  const words = content.split(/\\s+/);\n\n  let start = 0;\n  let chunkIndex = 0;\n\n  while (start < words.length) {\n    const end = Math.min(start + CHUNK_SIZE, words.length);\n    const chunkText = words.slice(start, end).join(' ');\n\n    output.push({\n      json: {\n        source_file,\n        department,\n        chunk_index: chunkIndex,\n        content: chunkText\n      }\n    });\n\n    chunkIndex++;\n    if (end === words.length) break;\n    start = end - OVERLAP;\n  }\n}\n\nreturn output;"
+      },
+      "id": "37e2c771-5f96-43fc-94d2-0fb7ae2dbe19",
+      "name": "Chunk Text1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1408, -80]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1632, -80],
+      "id": "5e3a754f-d710-411e-b511-ffd01f831d7e",
+      "name": "Loop Over Items"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/embeddings",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"nomic-embed-text\",\n  \"prompt\": {{ JSON.stringify($json.content) }}\n}",
+        "options": {}
+      },
+      "id": "71128970-b4ae-47ca-ad90-67cefd03d57a",
+      "name": "Ollama - Embed Chunk1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1856, -176]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge the embedding result back with the original chunk metadata\nconst originalItems = $('Chunk Text1').all();\nconst embedItems = $input.all();\n\nconst output = [];\n\nfor (let i = 0; i < embedItems.length; i++) {\n  const original = originalItems[i].json;\n  const embedding = embedItems[i].json.embedding.values;\n\n  output.push({\n    json: {\n      content: original.content,\n      source_file: original.source_file,\n      department: original.department,\n      chunk_index: original.chunk_index,\n      embedding: embedding\n    }\n  });\n}\n\nreturn output;"
+      },
+      "id": "bac81d61-d385-42f0-ab83-05e78db20fc4",
+      "name": "Merge Embedding + Metadata1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1856, 16]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "insert into documents (content, embedding, source_file, department, chunk_index)\nvalues ($1, $2::vector, $3, $4, $5);",
+        "options": {
+          "queryReplacement": "={{ [$json.content, JSON.stringify($json.embedding), $json.source_file, $json.department, $json.chunk_index] }}"
+        }
+      },
+      "id": "30b6d21f-74dd-4422-bfd0-51456ae20f51",
+      "name": "Supabase - Replace Chunk1",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2080, 16],
+      "credentials": {
+        "postgres": {
+          "id": "A9yJq4r8Yb4kYctm",
+          "name": "Postgres account 2"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "When clicking Test workflow": {
+      "main": [[{ "node": "Google Drive - List Files1", "type": "main", "index": 0 }]]
+    },
+    "Google Drive - List Files1": {
+      "main": [[{ "node": "Delete old chunks", "type": "main", "index": 0 }]]
+    },
+    "Delete old chunks": {
+      "main": [[{ "node": "Google Drive - Download File1", "type": "main", "index": 0 }]]
+    },
+    "Google Drive - Download File1": {
+      "main": [[{ "node": "Extract PDF Text", "type": "main", "index": 0 }]]
+    },
+    "Extract PDF Text": {
+      "main": [[{ "node": "Parse File to Text1", "type": "main", "index": 0 }]]
+    },
+    "Parse File to Text1": {
+      "main": [[{ "node": "Chunk Text1", "type": "main", "index": 0 }]]
+    },
+    "Chunk Text1": {
+      "main": [[{ "node": "Loop Over Items", "type": "main", "index": 0 }]]
+    },
+    "Loop Over Items": {
+      "main": [
+        [{ "node": "Merge Embedding + Metadata1", "type": "main", "index": 0 }],
+        [{ "node": "Ollama - Embed Chunk1", "type": "main", "index": 0 }]
+      ]
+    },
+    "Ollama - Embed Chunk1": {
+      "main": [[{ "node": "Loop Over Items", "type": "main", "index": 0 }]]
+    },
+    "Merge Embedding + Metadata1": {
+      "main": [[{ "node": "Supabase - Replace Chunk1", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {
+    "Google Drive - List Files1": [
+      {
+        "id": "1VaupSZv1QjyxaWtrWx3BV1UkeQ97n-3y",
+        "name": "aapl-20260328.pdf"
+      }
+    ]
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "e5c1d4aef9ec54c684c4f90a50d20a934e24b7425534c34479b197802ba58f46"
+  }
+}
