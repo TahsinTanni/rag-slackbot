@@ -1,0 +1,420 @@
+{
+  "name": "RAG Query - Knowledge Base",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// Extract and validate the query from the webhook body\nconst body = $input.first().json.body;\nconst query = body?.query || body?.text || '';\n\nif (!query || query.trim() === '') {\n throw new Error('No query provided in request body. Send { \"query\": \"your question here\" }');\n}\n\nreturn [{ json: { query: query.trim() } }];"
+      },
+      "id": "b4c18153-cc97-4c7e-8762-09bc580a2df8",
+      "name": "Extract Query",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -512,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/embeddings",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: \"nomic-embed-text\", prompt: $json.query }) }}",
+        "options": {}
+      },
+      "id": "cef7f827-257a-4fd3-a910-51f15e01d4d5",
+      "name": "Ollama - Embed Query",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -288,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge embedding back with original query\nconst query = $('Extract Query').first().json.query;\nconst embedding = $input.first().json.embedding;\n\nreturn [{ json: { query, embedding } }];"
+      },
+      "id": "96202de8-2c5b-4f91-9c5e-0d92d4e75924",
+      "name": "Merge Query + Embedding",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -64,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "select * from match_documents($1::vector, $2, $3);",
+        "options": {
+          "queryReplacement": "={{ [`[${$json.embedding.join(',')}]`, 0.0, 10] }}"
+        }
+      },
+      "id": "25ba396a-fd40-406f-b083-bffd755559dd",
+      "name": "Supabase - match_documents",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        160,
+        544
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "A9yJq4r8Yb4kYctm",
+          "name": "Postgres account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Assemble context block and compute confidence score\nconst chunks = $input.all();\nconst query = $('Extract Query').first().json.query;\n\nconst topScore = chunks.length > 0 ? parseFloat(chunks[0].json.similarity) : 0;\n\nconst context = chunks\n .map((c, i) => `[Source ${i+1}: ${c.json.source_file} | dept: ${c.json.department}]\\n${c.json.content}`)\n .join('\\n\\n');\n\nconst sources = chunks.map(c => c.json.source_file);\nconst uniqueSources = [...new Set(sources)];\n\nreturn [{\n json: {\n query,\n context,\n sources: uniqueSources,\n top_similarity: topScore,\n chunk_count: chunks.length\n }\n}];"
+      },
+      "id": "bc70cc05-f693-4bf4-a28b-266a3095d792",
+      "name": "Build Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        384,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "confidence-check",
+              "leftValue": "={{ $json.top_similarity }}",
+              "rightValue": 0.5,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4bec386d-c687-4434-a1cb-87a7e63a16c4",
+      "name": "Confidence Check (≥0.5)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        608,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ contents: [ { parts: [ { text: `Answer the question using ONLY the context below. If the answer is clearly present in the context, answer it directly and do not refuse. If the answer is not in the context, say exactly: \"I don't have enough information to answer this.\"\\n\\nContext:\\n${$json.context}\\n\\nQuestion: ${$json.query}\\n\\nAnswer:` } ] } ] }) }}",
+        "options": {}
+      },
+      "id": "6391ca84-1a5e-470b-9547-69531d0b4273",
+      "name": "Gemini - Generate Answer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        832,
+        448
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "9cFVmWgT3ieBQVlT",
+          "name": "Header Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format the grounded answer with sources\nconst response = $input.first().json;\nconst answer = response.candidates[0].content.parts[0].text.trim();\nconst ctx = $('Build Context').first().json;\n\nconst sourcesArray = ctx.sources;\n\nreturn [{\n json: {\n query: ctx.query,\n answer,\n sources: sourcesArray,\n confidence: ctx.top_similarity,\n escalated: false,\n final_message: `${answer}\\n\\n_Sources: ${sourcesArray.join(', ')}_`,\n response_type: 'answer'\n }\n}];"
+      },
+      "id": "de3c15c1-f488-4e76-875a-4881bcd8ebd8",
+      "name": "Format Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1056,
+        448
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "insert into usage_log (query, answer, sources, confidence, escalated) values ($1, $2, $3::text[], $4, $5);",
+        "options": {
+          "queryReplacement": "={{ [$json.query, $json.answer, $json.sources, $json.confidence, $json.escalated] }}"
+        }
+      },
+      "id": "62d9afbb-1e2a-4b03-bbf1-cfa4b096d518",
+      "name": "Log Answer",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1280,
+        448
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "A9yJq4r8Yb4kYctm",
+          "name": "Postgres account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ response_type: 'answer', message: $('Format Answer').first().json.final_message, confidence: $('Format Answer').first().json.confidence, sources: $('Format Answer').first().json.sources }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "956cba22-35cf-4f65-984f-47b615913fde",
+      "name": "Respond - Answer",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1504,
+        448
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Low confidence — prepare escalation\nconst ctx = $('Build Context').first().json;\n\nreturn [{\n json: {\n query: ctx.query,\n answer: null,\n sources: [],\n confidence: ctx.top_similarity,\n escalated: true,\n escalation_message: `A question could not be answered with sufficient confidence and requires human review.\\n\\n*Question:* ${ctx.query}\\n*Best similarity score:* ${ctx.top_similarity.toFixed(3)}\\n\\nPlease respond to the user directly.`,\n response_type: 'escalation'\n }\n}];"
+      },
+      "id": "395c0a8b-fbf1-44db-809b-2d3e848a6828",
+      "name": "Prepare Escalation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        832,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "insert into usage_log (query, answer, sources, confidence, escalated) values ($1, $2, $3::text[], $4, $5);",
+        "options": {
+          "queryReplacement": "={{ [$json.query, null, '{}', $json.confidence, true] }}"
+        }
+      },
+      "id": "107b059c-efb5-43bd-9071-d0584074a925",
+      "name": "Log Escalation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1056,
+        640
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "A9yJq4r8Yb4kYctm",
+          "name": "Postgres account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ response_type: 'escalation', message: $('Prepare Escalation').first().json.escalation_message, confidence: $('Prepare Escalation').first().json.confidence }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "f78d0e6c-6119-4e59-a7a3-96ecdff8d488",
+      "name": "Respond - Escalation",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1280,
+        640
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "rag-query",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "2e2063d1-fdd1-4d2e-a7fb-3837489ca9f3",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -736,
+        544
+      ],
+      "webhookId": "0c636679-72b1-4644-847b-2fcc92fda84a"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Extract Query": {
+      "main": [
+        [
+          {
+            "node": "Ollama - Embed Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama - Embed Query": {
+      "main": [
+        [
+          {
+            "node": "Merge Query + Embedding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Query + Embedding": {
+      "main": [
+        [
+          {
+            "node": "Supabase - match_documents",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase - match_documents": {
+      "main": [
+        [
+          {
+            "node": "Build Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Context": {
+      "main": [
+        [
+          {
+            "node": "Confidence Check (≥0.5)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Confidence Check (≥0.5)": {
+      "main": [
+        [
+          {
+            "node": "Gemini - Generate Answer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini - Generate Answer": {
+      "main": [
+        [
+          {
+            "node": "Format Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Answer": {
+      "main": [
+        [
+          {
+            "node": "Log Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Answer": {
+      "main": [
+        [
+          {
+            "node": "Respond - Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Escalation": {
+      "main": [
+        [
+          {
+            "node": "Log Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Escalation": {
+      "main": [
+        [
+          {
+            "node": "Respond - Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "cc627874-835a-42ab-8735-77db68c095fd",
+  "meta": {
+    "instanceId": "e5c1d4aef9ec54c684c4f90a50d20a934e24b7425534c34479b197802ba58f46"
+  },
+  "id": "AxPp0aAO53iBkYmc",
+  "tags": []
+}
